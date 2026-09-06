@@ -1,0 +1,61 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="HTTP-сервер с нуля — учебный проект магазина одежды, группа 251-352"><title>HTTP-сервер с нуля | Одежда / проект</title><link rel="stylesheet" href="style.css"></head><body><a class="skip" href="#main">К содержимому</a><header><div class="container header"><a class="brand" href="index.html">ОДЕЖДА / ПРОЕКТ</a><nav aria-label="Основная навигация"><a href="index.html">Главная</a><a href="about.html">О проекте</a><a href="members.html">Участники</a><a href="journal.html">Журнал</a><a href="resources.html">Ресурсы</a><a href="catalog.html">Каталог</a><a href="technology.html" aria-current="page">HTTP-сервер</a></nav></div></header><main id="main"><div class="container page-title"><p class="eyebrow">Учебная практика / 2026</p><h1>HTTP-сервер с нуля</h1><p class="lead">Вариативная часть: от TCP-соединения до выдачи файла.</p></div><section class="container section prose"><figure><video controls preload="metadata" style="width:100%" aria-label="Демонстрация HTTP-ответов"><source src="assets/demo.webm" type="video/webm"></video><figcaption>20 секунд: реальные ответы локального сервера на GET, HEAD, 404 и обход пути. Без звука.</figcaption></figure><p><a href="assets/tutorial.md" download>Скачать руководство Markdown</a></p><h2>1. Задача и выбор технологии</h2>
+<p>Вариант 2.2: реализовать небольшой HTTP-сервер, который обслуживает сайт магазина одежды. Используется Python 3.9+ и стандартная библиотека. Модуль socket предоставляет доступ к TCP; готовые серверные классы http.server и веб-фреймворки не используются. «С нуля» относится к обработке HTTP поверх предоставленного ОС TCP, а не к собственной реализации TCP/IP.</p>
+<p>Аналоги: python -m http.server быстро раздаёт файлы, Flask удобен для приложений, nginx рассчитан на промышленное обслуживание. Для изучения запросов и ответов выбран собственный последовательный обработчик. Его нельзя считать заменой этим продуктам.</p>
+<p><img alt="Архитектура" src="assets/architecture.svg" /></p>
+<h2>2. Подготовка и структура</h2>
+<p>Установить Python 3.9 или новее. Дополнительные pip-пакеты для запуска проекта не нужны. Создать рядом папки site, src и tests. HTML, CSS, JavaScript и изображения находятся в site. Основной код — src/server.py.</p>
+<pre><code class="language-bash">py --version
+py src/server.py
+</code></pre>
+<p>Открыть http://127.0.0.1:8000. Чтобы остановить процесс, нажать Ctrl+C. При занятом порте запустить py src/server.py --port 8001. На Linux и macOS использовать python3 вместо py. Корень site вычисляется от расположения server.py, поэтому не зависит от текущей рабочей директории.</p>
+<h2>3. TCP-соединение</h2>
+<p>В функции main создаётся AF_INET / SOCK_STREAM-сокет. bind связывает его с 127.0.0.1 и выбранным портом; listen включает ожидание. accept возвращает отдельный сокет клиента. После обработки одного запроса соединение закрывается.</p>
+<pre><code class="language-python">with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+    server.bind(('127.0.0.1', 8000))
+    server.listen(8)
+    conn, address = server.accept()
+    with conn:
+        handle(conn)
+</code></pre>
+<p>Это сокращённая иллюстрация. В итоговом main есть цикл, параметры командной строки и остановка Ctrl+C. Адрес loopback ограничивает доступ текущим компьютером.</p>
+<h2>4. Сборка заголовка из потока</h2>
+<p>TCP не сохраняет границы HTTP-сообщений. Один recv может вернуть только часть заголовка, поэтому read_header накапливает байты до последовательности CRLF CRLF. Заголовок ограничен 16384 байтами; общий срок ожидания — 5 секунд, он не сбрасывается после каждого байта.</p>
+<pre><code class="language-python">data.extend(chunk)
+end = data.find(b'\r\n\r\n')
+</code></pre>
+<p>Превышение размера даёт 431, таймаут — 408, обрыв неполного запроса — 400. Сервер принимает только запросы без тела. Это упрощает границы сообщения; keep-alive и pipeline не поддерживаются.</p>
+<p><img alt="Обработка запроса" src="assets/request.svg" /></p>
+<h2>5. Разбор HTTP</h2>
+<p>Первая строка имеет вид GET /catalog.html HTTP/1.1. parse_request проверяет число частей и версию HTTP/1.0 или HTTP/1.1. Для HTTP/1.1 обязателен Host. Дубли заголовков и некорректные имена отклоняются в рамках упрощённой модели.</p>
+<p>GET возвращает файл. HEAD формирует тот же ответ, но не отправляет тело. Другие методы получают 405 и Allow: GET, HEAD. Transfer-Encoding и ненулевой Content-Length отклоняются, поскольку входящее тело не обрабатывается.</p>
+<h2>6. Безопасное преобразование URL в путь</h2>
+<p>Сначала отделяется query string, затем выполняется однократное декодирование percent-encoding. Проверяется корректность процентов и UTF-8. Запрещены управляющие символы, обратные слеши, двоеточия, скрытые сегменты и .. . Далее resolve нормализует путь, включая символические ссылки, а relative_to проверяет принадлежность корню site.</p>
+<pre><code class="language-python">path = (root / raw.lstrip('/')).resolve()
+try:
+    path.relative_to(root)
+except ValueError:
+    raise RequestError(403)
+</code></pre>
+<p>Для каталога проверяется index.html, также после разрешения символических ссылок. Нельзя обслуживать весь репозиторий, поскольку тогда документы и исходный код окажутся доступны через HTTP. Тест проверяет как обычное ../, так и /%2e%2e/.</p>
+<p><img alt="Контроль пути" src="assets/paths.svg" /></p>
+<h2>7. HTTP-ответ</h2>
+<p>response формирует строку статуса и заголовки Content-Type, Content-Length, Connection: close, X-Content-Type-Options и Cache-Control. Длина вычисляется по байтам, не по числу символов: это важно для кириллицы. sendall отправляет весь переданный буфер или сообщает об ошибке.</p>
+<pre><code class="language-python">fields = [f'HTTP/1.1 {status} {STATUS[status]}',
+          f'Content-Length: {len(body)}', 'Connection: close']
+# В полном коде также задаются Content-Type и другие заголовки.
+</code></pre>
+<p>Статический файл читается как bytes, поэтому изображения не повреждаются. Выдача ограничена 16 MiB на файл. Для HTML/CSS/JS типы заданы явно; иначе используется mimetypes или application/octet-stream.</p>
+<h2>8. Модификация относительно минимального сервера</h2>
+<p>Базовый вариант мог возвращать один фиксированный HTML-ответ. В итоговую реализацию добавлены выдача нескольких файлов, MIME-типы, HEAD, страница ошибки, разбор query string, локальный корень, защита путей и символических ссылок, лимиты времени и памяти, настройка порта, логирование и автоматические тесты.</p>
+<p>Для сайта добавлена клиентская фильтрация и сортировка каталога. Статические карточки находятся в HTML: при отключении JavaScript каталог остаётся читаемым.</p>
+<h2>9. Проверки</h2>
+<pre><code class="language-bash">py -m unittest discover -s tests -v
+</code></pre>
+<p>Тесты поднимают реальный loopback TCP-сокет во временном каталоге, отправляют запросы и сравнивают HTTP-ответы. Проверяются кириллица и байтовая длина, CSS, бинарные файлы, GET, HEAD, query string, 404, 405, выход за корень, скрытые файлы, неверное кодирование, отсутствие Host, неполный заголовок, ограничение размера и запрет тела.</p>
+<p>В среде подготовки 05.09.2026 успешно выполнен 21 тест. На Windows тест символической ссылки может быть пропущен, если ОС не разрешает её создавать. Это не следует выдавать за проверенную защиту в данной среде: остальные тесты остаются обязательными.</p>
+<h2>10. Ограничения и развитие</h2>
+<p>Сервер обрабатывает клиентов последовательно, поэтому медленный запрос временно задерживает остальных. Нет TLS, POST, Range, gzip, keep-alive и полноценного RFC-парсера. Возможна гонка между проверкой пути и открытием файла, если другой локальный процесс одновременно заменяет файлы или ссылки. Корень должен оставаться доверенным и неизменяемым во время демонстрации. Код предназначен для localhost, а не для публичного размещения.</p>
+<p>Дальнейшее развитие: пул обработчиков с лимитом, журнал в файл, кеширование и выделение парсера. Эти возможности не заявляются реализованными.</p>
+<h2>11. Источники и полный код</h2>
+<p><a href="https://docs.python.org/3/library/socket.html">Python socket</a>, <a href="https://docs.python.org/3/library/urllib.parse.html">urllib.parse</a>, <a href="https://www.rfc-editor.org/rfc/rfc9110.html">RFC 9110</a>, <a href="https://www.rfc-editor.org/rfc/rfc9112.html">RFC 9112</a>.</p>
+<p>Полная реализация: <a href="assets/server.py.txt">server.py</a>. Проверки: <a href="assets/test_server.py.txt">test_server.py</a>. Код и текст подготовлены с помощью ChatGPT; перед защитой участникам необходимо самостоятельно проверить и объяснить решения.</p></section></main><footer><div class="container"><p>Московский Политех · Альдали Аммар и Алали Мохامмад · 251-352</p><p>Учебный прототип. Товары и цены демонстрационные, реальные заказы не принимаются.</p></div></footer></body></html>

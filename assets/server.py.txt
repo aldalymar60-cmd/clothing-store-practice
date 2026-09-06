@@ -1,0 +1,176 @@
+"""A deliberately small, local HTTP/1.x static server built on TCP sockets.
+No http.server, Flask, Django or third-party dependency. Python >= 3.9.
+"""
+import argparse
+import logging
+import mimetypes
+import re
+import socket
+import time
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+ROOT = Path(__file__).resolve().parents[1] / 'site'
+MAX_HEADER = 16384
+MAX_FILE = 16 * 1024 * 1024
+STATUS = {200: 'OK', 400: 'Bad Request', 403: 'Forbidden', 404: 'Not Found',
+          405: 'Method Not Allowed', 408: 'Request Timeout',
+          413: 'Content Too Large', 431: 'Request Header Fields Too Large', 500: 'Internal Server Error'}
+TYPES = {'.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
+         '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml',
+         '.jpg': 'image/jpeg', '.png': 'image/png', '.webm': 'video/webm'}
+
+class RequestError(Exception):
+    def __init__(self, status):
+        self.status = status
+
+
+def read_header(conn):
+    """TCP may fragment a request: receive until the header delimiter."""
+    data = bytearray()
+    deadline = time.monotonic() + 5
+    while b'\r\n\r\n' not in data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RequestError(408)
+        conn.settimeout(remaining)
+        try:
+            chunk = conn.recv(min(4096, MAX_HEADER + 1 - len(data)))
+        except socket.timeout:
+            raise RequestError(408)
+        if not chunk:
+            raise RequestError(400)
+        data.extend(chunk)
+        end = data.find(b'\r\n\r\n')
+        if (end < 0 and len(data) > MAX_HEADER) or (end >= 0 and end + 4 > MAX_HEADER):
+            raise RequestError(431)
+    return bytes(data[:data.index(b'\r\n\r\n')])
+
+
+def parse_request(header):
+    lines = header.decode('iso-8859-1').split('\r\n')
+    parts = lines[0].split(' ')
+    if len(parts) != 3:
+        raise RequestError(400)
+    method, target, version = parts
+    if version not in ('HTTP/1.0', 'HTTP/1.1') or not target.startswith('/'):
+        raise RequestError(400)
+    headers = {}
+    for line in lines[1:]:
+        if ':' not in line:
+            raise RequestError(400)
+        key, value = line.split(':', 1)
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key):
+            raise RequestError(400)
+        key = key.lower()
+        if key in headers:
+            raise RequestError(400)
+        headers[key] = value.strip()
+    if version == 'HTTP/1.1' and not headers.get('host'):
+        raise RequestError(400)
+    if method not in ('GET', 'HEAD'):
+        raise RequestError(405)
+    # This single-request server does not accept request bodies or transfer coding.
+    if 'transfer-encoding' in headers or headers.get('content-length', '0') != '0':
+        raise RequestError(400)
+    return method, target
+
+
+def resolve_path(target, root):
+    if re.search(r'%(?![0-9A-Fa-f]{2})', target):
+        raise RequestError(400)
+    try:
+        raw = unquote(urlsplit(target).path, encoding='utf-8', errors='strict')
+    except (ValueError, UnicodeError):
+        raise RequestError(400)
+    if target.startswith('//') or any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        raise RequestError(400)
+    # Backslashes/colons are rejected for consistent Windows and POSIX behaviour.
+    if '\\' in raw or ':' in raw:
+        raise RequestError(403)
+    segments = raw.split('/')
+    if any(s == '..' or s.startswith('.') for s in segments if s):
+        raise RequestError(403)
+    root = root.resolve()
+    path = (root / raw.lstrip('/')).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        raise RequestError(403)
+    if path.is_dir():
+        path = (path / 'index.html').resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            raise RequestError(403)
+    return path
+
+
+def response(conn, status, body, content_type='text/html; charset=utf-8', head=False):
+    fields = [f'HTTP/1.1 {status} {STATUS[status]}', f'Content-Type: {content_type}',
+              f'Content-Length: {len(body)}', 'Connection: close',
+              'X-Content-Type-Options: nosniff', 'Cache-Control: no-store']
+    if status == 405:
+        fields.append('Allow: GET, HEAD')
+    conn.sendall(('\r\n'.join(fields) + '\r\n\r\n').encode('ascii'))
+    if not head:
+        conn.sendall(body)
+
+
+def handle(conn, root=ROOT):
+    method, target, status = '', '', 500
+    try:
+        header = read_header(conn)
+        method = header.split(b' ', 1)[0].decode('ascii', errors='replace')
+        method, target = parse_request(header)
+        path = resolve_path(target, root)
+        if not path.is_file():
+            raise RequestError(404)
+        if path.stat().st_size > MAX_FILE:
+            raise RequestError(413)
+        # Limit bytes even if a file grows between stat() and read().
+        with path.open('rb') as stream:
+            body = stream.read(MAX_FILE + 1)
+        if len(body) > MAX_FILE:
+            raise RequestError(413)
+        mime = TYPES.get(path.suffix.lower(), mimetypes.guess_type(path.name)[0] or 'application/octet-stream')
+        status = 200
+        response(conn, status, body, mime, method == 'HEAD')
+    except (RequestError, OSError, ValueError) as exc:
+        status = exc.status if isinstance(exc, RequestError) else 500
+        body = (f'<!doctype html><html lang="en"><meta charset="utf-8">'
+                f'<title>{status} {STATUS[status]}</title><h1>{status} {STATUS[status]}</h1>'
+                '<p><a href="/">Home</a></p></html>').encode('utf-8')
+        try:
+            response(conn, status, body, head=(method == 'HEAD'))
+        except OSError:
+            pass
+    finally:
+        logging.info('%s %r %s', method, target, status)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--port', type=int, default=8000)
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error('port must be between 1 and 65535')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(('127.0.0.1', args.port))
+        server.listen(8)
+        print(f'Open http://127.0.0.1:{args.port} | Ctrl+C to stop', flush=True)
+        try:
+            while True:
+                conn, _ = server.accept()
+                with conn:
+                    handle(conn)
+        except KeyboardInterrupt:
+            print('\nStopped.')
+
+if __name__ == '__main__':
+    main()

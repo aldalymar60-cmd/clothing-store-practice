@@ -1,0 +1,74 @@
+"""HTTP integration tests over a real loopback TCP connection."""
+import socket
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+from server import handle, MAX_HEADER
+
+class ServerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / 'site'
+        self.root.mkdir()
+        (self.root / 'index.html').write_text('Привет', encoding='utf-8')
+        (self.root / 'style.css').write_text('body{}', encoding='utf-8')
+        (Path(self.temp.name) / 'secret.txt').write_text('secret')
+        (self.root / 'binary.png').write_bytes(bytes(range(256)))
+    def tearDown(self):
+        self.temp.cleanup()
+    def request(self, raw):
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0)); listener.listen(1)
+        def run():
+            conn,_ = listener.accept()
+            with conn: handle(conn, self.root)
+            listener.close()
+        t=threading.Thread(target=run);t.start()
+        with socket.create_connection(listener.getsockname(), timeout=8) as c:
+            if isinstance(raw, list):
+                for block in raw: c.sendall(block)
+            else: c.sendall(raw)
+            c.shutdown(socket.SHUT_WR)
+            data=b''
+            while True:
+                try: part=c.recv(65536)
+                except ConnectionResetError: break
+                if not part: break
+                data+=part
+        t.join(8)
+        self.assertFalse(t.is_alive())
+        header,body=data.split(b'\r\n\r\n',1)
+        return int(header.split(b' ')[1]),header,body
+    def get(self,path):return self.request(f'GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n'.encode())
+    def test_root_utf8(self):
+        code,h,b=self.get('/');self.assertEqual(code,200);self.assertEqual(b,'Привет'.encode());self.assertIn(b'Content-Length: 12',h)
+    def test_query(self):self.assertEqual(self.get('/index.html?q=1')[0],200)
+    def test_css(self):self.assertIn(b'text/css',self.get('/style.css')[1])
+    def test_binary(self):self.assertEqual(self.get('/binary.png')[2],bytes(range(256)))
+    def test_head(self):
+        code,h,b=self.request(b'HEAD / HTTP/1.1\r\nHost: x\r\n\r\n');self.assertEqual(code,200);self.assertEqual(b,b'');self.assertIn(b'Content-Length: 12',h)
+    def test_head_missing(self):self.assertEqual(self.request(b'HEAD /missing HTTP/1.1\r\nHost: x\r\n\r\n')[2],b'')
+    def test_missing(self):self.assertEqual(self.get('/missing')[0],404)
+    def test_traversal(self):self.assertEqual(self.get('/../secret.txt')[0],403)
+    def test_encoded_traversal(self):self.assertEqual(self.get('/%2e%2e/secret.txt')[0],403)
+    def test_windows_path(self):self.assertEqual(self.get('/..%5csecret.txt')[0],403)
+    def test_hidden(self):self.assertEqual(self.get('/.git/config')[0],403)
+    def test_bad_escape(self):self.assertEqual(self.get('/%xy')[0],400)
+    def test_null(self):self.assertEqual(self.get('/%00')[0],400)
+    def test_host_required(self):self.assertEqual(self.request(b'GET / HTTP/1.1\r\n\r\n')[0],400)
+    def test_post(self):
+        code,h,b=self.request(b'POST / HTTP/1.1\r\nHost: x\r\n\r\n');self.assertEqual(code,405);self.assertIn(b'Allow: GET, HEAD',h)
+    def test_malformed(self):self.assertEqual(self.request(b'BAD\r\n\r\n')[0],400)
+    def test_incomplete(self):self.assertEqual(self.request(b'GET / HTTP/1.1')[0],400)
+    def test_header_limit(self):self.assertEqual(self.request(b'GET / HTTP/1.1\r\nHost: x\r\nX: '+b'a'*MAX_HEADER+b'\r\n\r\n')[0],431)
+    def test_fragmented(self):self.assertEqual(self.request([b'GET / HTTP/1.1\r\n',b'Host: x\r\n',b'\r\n'])[0],200)
+    def test_body_rejected(self):self.assertEqual(self.request(b'GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nx')[0],400)
+    def test_symlink_escape(self):
+        try:(self.root/'leak.txt').symlink_to(Path(self.temp.name)/'secret.txt')
+        except (OSError,NotImplementedError):self.skipTest('Symlink creation unavailable')
+        self.assertEqual(self.get('/leak.txt')[0],403)
+
+if __name__=='__main__':unittest.main()
